@@ -221,6 +221,7 @@ function NewBugModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
   const wsComponents = store.components.filter(c => c.productId === wsProduct?.id);
   
   const [title, setTitle] = useState(''); const [description, setDescription] = useState(''); const [severity, setSeverity] = useState<Severity>('Minor'); const [priority, setPriority] = useState<Priority>('P2'); const [componentId, setComponentId] = useState(wsComponents[0]?.id ?? ''); const [assigneeId, setAssigneeId] = useState(''); const [environment, setEnvironment] = useState('Limgrave (Prod)'); const [reproducibility, setReproducibility] = useState<Reproducibility>('Not Tried'); const [tagsStr, setTagsStr] = useState(''); const [storyPoints, setStoryPoints] = useState<number | ''>(''); const [dueDate, setDueDate] = useState(''); const [draftAttachments, setDraftAttachments] = useState<{name: string, url: string}[]>([]); const [codePatch, setCodePatch] = useState('');
+  const [submitError, setSubmitError] = useState('');
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files; if (!files) return;
@@ -228,12 +229,50 @@ function NewBugModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
   };
 
   const submitAction = () => {
-    if (!title.trim() || !wsProduct) return;
+    setSubmitError('');
+
+    if (!title.trim()) return;
+
+    if (!currentWs || !store.currentUserId) {
+      setSubmitError('No active realm is available. Refresh the page and try again.');
+      return;
+    }
+
+    const productId = wsProduct?.id ?? uid('prod');
+    const resolvedComponentId = componentId || wsComponents[0]?.id || uid('comp');
     const id = uid('bug'); const wsBugs = store.bugs.filter((b) => b.workspaceId === currentWs?.id); const nextNumber = Math.max(...wsBugs.map((bug) => Number(bug.key.split('-')[1]) || 0), 100) + 1;
     const tagsArray = tagsStr.split(',').map(t => t.trim()).filter(Boolean);
     const finalAttachments: Attachment[] = draftAttachments.map(a => ({ id: uid('attachment'), fileName: a.name, fileUrl: a.url, uploadedBy: store.currentUserId ?? 'u1', createdAt: now() }));
-    const bug: Bug = { id, workspaceId: currentWs?.id ?? 'ws1', key: `${currentWs?.key ?? 'FOE'}-${nextNumber}`, title: title.trim(), description: description.trim() || 'No lore provided.', productId: wsProduct.id, componentId: componentId || wsComponents[0]?.id, stage: 'Triage', resolution: null, severity, priority, assigneeId, reporterId: store.currentUserId ?? 'u1', ccList: [], createdAt: now(), updatedAt: now(), comments: [], history: [], dependsOn: [], duplicateOf: null, environment, reproducibility, tags: tagsArray, storyPoints: storyPoints === '' ? null : Number(storyPoints), dueDate: dueDate || null, attachments: finalAttachments, codePatch: codePatch.trim() || undefined };
-    updateStore((current) => ({ ...current, bugs: [bug, ...(current.bugs || [])] })); onCreated(id);
+    const bug: Bug = { id, workspaceId: currentWs.id, key: `${currentWs.key ?? 'FOE'}-${nextNumber}`, title: title.trim(), description: description.trim() || 'No lore provided.', productId, componentId: resolvedComponentId, stage: 'Triage', resolution: null, severity, priority, assigneeId, reporterId: store.currentUserId, ccList: [], createdAt: now(), updatedAt: now(), comments: [], history: [], dependsOn: [], duplicateOf: null, environment, reproducibility, tags: tagsArray, storyPoints: storyPoints === '' ? null : Number(storyPoints), dueDate: dueDate || null, attachments: finalAttachments, codePatch: codePatch.trim() || undefined };
+
+    updateStore((current) => ({
+      ...current,
+      products: wsProduct
+        ? current.products
+        : [
+            ...current.products,
+            {
+              id: productId,
+              workspaceId: currentWs.id,
+              name: 'Golden Order',
+              key: currentWs.key,
+              description: 'Default Product',
+            },
+          ],
+      components: wsComponents.length > 0
+        ? current.components
+        : [
+            ...current.components,
+            {
+              id: resolvedComponentId,
+              productId,
+              name: 'The Lands Between',
+              color: '#c5a865',
+            },
+          ],
+      bugs: [bug, ...(current.bugs || [])],
+    }));
+    onCreated(id);
   };
 
   return (
@@ -266,7 +305,7 @@ function NewBugModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
                 <h3 className="mb-4 text-lg font-bold  font-serif text-[hsl(var(--primary))]">Attributes</h3>
                 <div className="space-y-4">
                   <div><label className="mb-1 block text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Summoned <span className="tracking-normal font-sans normal-case opacity-70">(Assignee)</span></label><select value={assigneeId} onChange={e => setAssigneeId(e.target.value)} className="w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-2 py-1.5 text-lg font-serif font-bold shadow-sm outline-none text-[hsl(var(--foreground))]"><option value="">No summon sign</option>{(store.users || []).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></div>
-                  <div className="grid grid-cols-2 gap-2"><div><label className="mb-1 block text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Threat <span className="block tracking-normal font-sans normal-case opacity-70">(Severity)</span></label><select value={severity} onChange={e => setSeverity(e.target.value as Severity)} className="w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-2 py-1.5 text-base font-serif font-bold shadow-sm outline-none">{Object.keys(severityMeta).map((v) => <option key={v}>{severityMeta[v as Severity].label}</option>)}</select></div><div><label className="mb-1 block text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Urgency <span className="block tracking-normal font-sans normal-case opacity-70">(Priority)</span></label><select value={priority} onChange={e => setPriority(e.target.value as Priority)} className="w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-2 py-1.5 text-base font-serif font-bold shadow-sm outline-none">{['P0', 'P1', 'P2', 'P3'].map((v) => <option key={v}>{v === 'P0' ? 'Urgent' : v}</option>)}</select></div></div>
+                  <div className="grid grid-cols-2 gap-2"><div><label className="mb-1 block text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Threat <span className="block tracking-normal font-sans normal-case opacity-70">(Severity)</span></label><select value={severity} onChange={e => setSeverity(e.target.value as Severity)} className="w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-2 py-1.5 text-base font-serif font-bold shadow-sm outline-none">{Object.keys(severityMeta).map((v) => <option key={v} value={v}>{severityMeta[v as Severity].label}</option>)}</select></div><div><label className="mb-1 block text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Urgency <span className="block tracking-normal font-sans normal-case opacity-70">(Priority)</span></label><select value={priority} onChange={e => setPriority(e.target.value as Priority)} className="w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-2 py-1.5 text-base font-serif font-bold shadow-sm outline-none">{['P0', 'P1', 'P2', 'P3'].map((v) => <option key={v} value={v}>{v === 'P0' ? 'Urgent' : v}</option>)}</select></div></div>
                   <div><label className="mb-1 block text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Region <span className="tracking-normal font-sans normal-case opacity-70">(Component)</span></label><select value={componentId} onChange={e => setComponentId(e.target.value)} className="w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-2 py-1.5 text-lg font-serif font-bold shadow-sm outline-none">{wsComponents.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
                   
                   <div className="my-4 h-px bg-[hsl(var(--border)/.5)]" />
@@ -282,7 +321,10 @@ function NewBugModal({ onClose, onCreated }: { onClose: () => void; onCreated: (
         </div>
 
         <div className="flex items-center justify-between border-t border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-6 py-4">
-          <p className="text-[15px] font-serif text-[hsl(var(--muted-foreground))]">The scrolls accept ancient Markdown formatting.</p>
+          <div>
+            <p className="text-[15px] font-serif text-[hsl(var(--muted-foreground))]">The scrolls accept ancient Markdown formatting.</p>
+            {submitError && <p className="mt-1 text-[15px] font-serif text-[hsl(var(--destructive))]">{submitError}</p>}
+          </div>
           <div className="flex gap-2">
             <button onClick={onClose} className="border border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-5 py-2 text-lg font-bold font-serif hover:bg-[hsl(var(--muted)/.5)] hover:text-[hsl(var(--primary))] transition-colors">Flee</button>
             <button onClick={submitAction} disabled={!title.trim()} className="bg-[hsl(var(--primary))] px-6 py-2 text-lg font-bold font-serif text-black shadow-[0_0_15px_rgba(197,168,101,0.4)] hover:brightness-125 disabled:opacity-50 transition-all">Declare Foe</button>
@@ -1176,7 +1218,7 @@ function WorkspacePage() {
         </div>
       </div>
       
-      {showFilters && <div className="mb-6 grid grid-cols-1 gap-4 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-6 sm:grid-cols-3"><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Battle State <span className="tracking-normal font-sans opacity-70">(Status)</span><select value={stageFilter} onChange={(event) => setStageFilter(event.target.value as Stage | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option>All</option>{stages.map((stage) => <option key={stage}>{stageMeta[stage].label}</option>)}</select></label><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Threat Level <span className="tracking-normal font-sans opacity-70">(Severity)</span><select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value as Severity | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option>All</option>{Object.keys(severityMeta).map((severity) => <option key={severity}>{severityMeta[severity as Severity].label}</option>)}</select></label><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Region <span className="tracking-normal font-sans opacity-70">(Component)</span><select value={componentFilter} onChange={(event) => setComponentFilter(event.target.value)} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option value="All">All</option>{store.components.filter(c => c.productId === (store.products.find(p => p.workspaceId === currentWs?.id)?.id)).map((component) => <option key={component.id} value={component.id}>{component.name}</option>)}</select></label></div>}
+      {showFilters && <div className="mb-6 grid grid-cols-1 gap-4 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-6 sm:grid-cols-3"><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Battle State <span className="tracking-normal font-sans opacity-70">(Status)</span><select value={stageFilter} onChange={(event) => setStageFilter(event.target.value as Stage | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option value="All">All</option>{stages.map((stage) => <option key={stage} value={stage}>{stageMeta[stage].label}</option>)}</select></label><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Threat Level <span className="tracking-normal font-sans opacity-70">(Severity)</span><select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value as Severity | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option value="All">All</option>{Object.keys(severityMeta).map((severity) => <option key={severity} value={severity}>{severityMeta[severity as Severity].label}</option>)}</select></label><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Region <span className="tracking-normal font-sans opacity-70">(Component)</span><select value={componentFilter} onChange={(event) => setComponentFilter(event.target.value)} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option value="All">All</option>{store.components.filter(c => c.productId === (store.products.find(p => p.workspaceId === currentWs?.id)?.id)).map((component) => <option key={component.id} value={component.id}>{component.name}</option>)}</select></label></div>}
       
       {viewMode === 'list' ? (
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">

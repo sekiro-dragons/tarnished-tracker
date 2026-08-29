@@ -14,7 +14,6 @@ import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
-import { OTPInput } from 'input-otp';
 import { HelpAssistant } from '@/components/help-assistant';
 import { getAuthRedirectUrl, supabase } from '@/lib/supabase';
 
@@ -344,12 +343,11 @@ function ZenModeOverlay({ bug, onClose }: { bug: Bug, onClose: () => void }) {
 
 function AuthScreen() {
   const [isSignup, setIsSignup] = useState(false);
-  const [step, setStep] = useState<'identity' | 'otp'>('identity');
+  const [step, setStep] = useState<'identity' | 'sent'>('identity');
 
   const [name, setName] = useState('');
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
-  const [otp, setOtp] = useState('');
 
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -366,7 +364,7 @@ function AuthScreen() {
     return () => window.clearInterval(timer);
   }, [resendIn]);
 
-  const requestOtp = async () => {
+  const requestMagicLink = async () => {
     setError('');
     setNotice('');
 
@@ -384,7 +382,7 @@ function AuthScreen() {
 
     setLoading(true);
 
-    const { error: otpError } = await supabase.auth.signInWithOtp({
+    const { error: magicLinkError } = await supabase.auth.signInWithOtp({
       email: normalizedEmail,
       options: {
         shouldCreateUser: isSignup,
@@ -400,43 +398,14 @@ function AuthScreen() {
 
     setLoading(false);
 
-    if (otpError) {
-      setError(otpError.message);
+    if (magicLinkError) {
+      setError(magicLinkError.message);
       return;
     }
 
-    setStep('otp');
-    setOtp('');
+    setStep('sent');
     setResendIn(60);
-    setNotice(`A sign-in sigil was sent to ${normalizedEmail}.`);
-  };
-
-  const verifyOtp = async () => {
-    setError('');
-    setNotice('');
-
-    if (!/^\d{6}$/.test(otp)) {
-      setError('Enter the full six-digit sigil.');
-      return;
-    }
-
-    setLoading(true);
-
-    const { error: verifyError } = await supabase.auth.verifyOtp({
-      email: email.trim().toLowerCase(),
-      token: otp,
-      type: 'email',
-    });
-
-    setLoading(false);
-
-    if (verifyError) {
-      setError('The Grace rejects this sigil. It may be invalid or expired.');
-      return;
-    }
-
-    // AppProvider listens for Supabase auth-state changes.
-    // Do not manually fake currentUserId here.
+    setNotice(`A sign-in link was sent to ${normalizedEmail}.`);
   };
 
   const signInWithProvider = async (provider: 'google' | 'github') => {
@@ -464,7 +433,6 @@ function AuthScreen() {
     setName('');
     setUsername('');
     setEmail('');
-    setOtp('');
     setError('');
     setNotice('');
     setResendIn(0);
@@ -498,8 +466,8 @@ function AuthScreen() {
         </div>
 
         <h2 className="mb-6 text-center font-serif text-[27px] tracking-wide text-white">
-          {step === 'otp'
-            ? 'Receive Guidance (Verify OTP)'
+          {step === 'sent'
+            ? 'Guidance Has Been Sent'
             : isSignup
               ? 'Arise, Tarnished (Sign Up)'
               : 'Touch Grace (Sign In)'}
@@ -551,11 +519,11 @@ function AuthScreen() {
 
               <button
                 type="button"
-                onClick={() => void requestOtp()}
+                onClick={() => void requestMagicLink()}
                 disabled={loading}
                 className="mt-5 w-full border border-[hsl(var(--primary))] bg-[hsl(var(--primary)/.1)] py-3.5 text-lg font-serif font-bold  text-[hsl(var(--primary))] transition-all hover:bg-[hsl(var(--primary))] hover:text-black shadow-[0_0_15px_rgba(197,168,101,0.2)] disabled:opacity-50"
               >
-                {loading ? 'Seeking Grace...' : 'Send Email Sigil (OTP)'}
+                {loading ? 'Seeking Grace...' : 'Send Sign-In Link'}
               </button>
             </div>
 
@@ -589,50 +557,21 @@ function AuthScreen() {
           </>
         ) : (
           <div>
-            <p className="mb-5 text-center font-serif text-lg leading-relaxed text-[hsl(var(--muted-foreground))]">
-              Enter the six-digit code sent to
+            <p className="mb-6 text-center font-serif text-lg leading-relaxed text-[hsl(var(--muted-foreground))]">
+              Check your inbox and open the sign-in link sent to
               <br />
               <span className="text-[hsl(var(--primary))]">{email}</span>
             </p>
 
-            <OTPInput
-              maxLength={6}
-              value={otp}
-              onChange={setOtp}
-              containerClassName="flex justify-center gap-2"
-              render={({ slots }) => (
-                <>
-                  {slots.map((slot, index) => (
-                    <div
-                      key={index}
-                      className={`flex h-12 w-10 items-center justify-center border bg-black/40 font-mono text-lg ${
-                        slot.isActive
-                          ? 'border-[hsl(var(--primary))] text-[hsl(var(--primary))] shadow-[0_0_12px_rgba(197,168,101,0.15)]'
-                          : 'border-[hsl(var(--border))] text-white'
-                      }`}
-                    >
-                      {slot.char ?? ''}
-                    </div>
-                  ))}
-                </>
-              )}
-            />
-
-            <button
-              type="button"
-              onClick={() => void verifyOtp()}
-              disabled={loading || otp.length !== 6}
-              className="mt-6 w-full border border-[hsl(var(--primary))] bg-[hsl(var(--primary)/.1)] py-3.5 text-lg font-serif font-bold  text-[hsl(var(--primary))] transition-all hover:bg-[hsl(var(--primary))] hover:text-black shadow-[0_0_15px_rgba(197,168,101,0.2)] disabled:opacity-50"
-            >
-              {loading ? 'Communing...' : 'Verify Grace'}
-            </button>
+            <p className="border border-[hsl(var(--primary)/.3)] bg-[hsl(var(--primary)/.08)] p-4 text-center font-serif text-lg leading-relaxed text-[hsl(var(--primary))]">
+              The link will return you here and open your realm automatically.
+            </p>
 
             <div className="mt-4 flex items-center justify-between gap-3">
               <button
                 type="button"
                 onClick={() => {
                   setStep('identity');
-                  setOtp('');
                   setError('');
                   setNotice('');
                 }}
@@ -643,11 +582,11 @@ function AuthScreen() {
 
               <button
                 type="button"
-                onClick={() => void requestOtp()}
+                onClick={() => void requestMagicLink()}
                 disabled={loading || resendIn > 0}
                 className="text-[15px] font-serif font-bold text-[hsl(var(--primary))] disabled:text-[hsl(var(--muted-foreground))]"
               >
-                {resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend code'}
+                {resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend link'}
               </button>
             </div>
           </div>

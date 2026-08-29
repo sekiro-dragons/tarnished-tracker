@@ -6,7 +6,7 @@ A database-free React + Vite bug tracking workspace. Tracker data is seeded and 
 
 Tarnished Tracker uses Supabase Auth for:
 
-- Email OTP
+- Email magic links
 - Google OAuth
 - GitHub OAuth
 

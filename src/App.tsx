@@ -13,6 +13,9 @@ import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
+import type { User as SupabaseUser } from '@supabase/supabase-js';
+import { OTPInput } from 'input-otp';
+import { getAuthRedirectUrl, supabase } from '@/lib/supabase';
 
 // --- INJECT DARK MODE GLOBALLY ---
 const GlobalStyles = () => (
@@ -60,7 +63,7 @@ type Priority = 'P0' | 'P1' | 'P2' | 'P3';
 type CommentType = 'Info' | 'Fix Proposed' | 'Needs Repro' | 'Verified';
 type Reproducibility = 'Always' | 'Sometimes' | 'Rarely' | 'Unable to Reproduce' | 'Not Tried';
 
-type User = { id: string; name: string; username: string; role: string; password?: string };
+type User = { id: string; name: string; username: string; role: string; email?: string; avatarUrl?: string; provider?: string };
 type Product = { id: string; workspaceId: string; name: string; key: string; description: string };
 type Component = { id: string; productId: string; name: string; color: string };
 type Comment = { id: string; authorId: string; body: string; commentType: CommentType; createdAt: string };
@@ -107,8 +110,7 @@ const loadStore = (): Store => {
 
 type WorkspaceContextValue = {
   store: Store; updateStore: (updater: (current: Store) => Store) => void; resetDemo: () => void;
-  login: (username: string, pass: string) => boolean; signup: (name: string, username: string, pass: string) => boolean;
-  logout: () => void; switchWorkspace: (workspaceId: string) => void; createWorkspace: (name: string, key: string) => string;
+  logout: () => Promise<void>; switchWorkspace: (workspaceId: string) => void; createWorkspace: (name: string, key: string) => string;
 };
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
@@ -141,20 +143,39 @@ const FEATURE_TEMPLATE = `**Lord's Decree:**\nAs a [role], I seek [feature] so t
 
 function Avatar({ user, size = 'sm' }: { user?: User; size?: 'sm' | 'md' }) {
   const initials = user?.name.split(' ').map((part) => part[0]).join('').slice(0, 2) ?? '?';
-  return <span title={user?.name} className={`inline-flex shrink-0 items-center justify-center bg-[hsl(var(--primary)/.15)] border border-[hsl(var(--primary)/.3)] font-serif font-bold text-[hsl(var(--primary))] ${size === 'md' ? 'h-9 w-9 text-sm' : 'h-6 w-6 text-[10px]'}`}>{initials}</span>;
+
+  const sizeClass = size === 'md' ? 'h-9 w-9 text-sm' : 'h-6 w-6 text-[10px]';
+
+  return (
+    <span
+      title={user?.name}
+      className={`inline-flex shrink-0 items-center justify-center overflow-hidden bg-[hsl(var(--primary)/.15)] border border-[hsl(var(--primary)/.3)] font-serif font-bold text-[hsl(var(--primary))] ${sizeClass}`}
+    >
+      {user?.avatarUrl ? (
+        <img
+          src={user.avatarUrl}
+          alt=""
+          referrerPolicy="no-referrer"
+          className="h-full w-full object-cover"
+        />
+      ) : (
+        initials
+      )}
+    </span>
+  );
 }
 
 function StageBadge({ stage, compact = false }: { stage: Stage; compact?: boolean }) {
   const meta = stageMeta[stage]; const Icon = meta.icon;
-  return <span className={`inline-flex items-center gap-1.5 border px-2 py-1 text-[10px] font-bold tracking-wide uppercase font-serif ${compact ? 'px-1.5 py-0.5' : ''}`} style={{ color: meta.tint, borderColor: `${meta.tint}40`, backgroundColor: `${meta.tint}10` }}><Icon size={compact ? 12 : 14} />{meta.label}</span>;
+  return <span className={`inline-flex items-center gap-1.5 border px-2 py-1 text-[15px] font-bold tracking-wide  font-serif ${compact ? 'px-1.5 py-0.5' : ''}`} style={{ color: meta.tint, borderColor: `${meta.tint}40`, backgroundColor: `${meta.tint}10` }}><Icon size={compact ? 12 : 14} />{meta.label}</span>;
 }
 function SeverityBadge({ severity }: { severity: Severity }) {
   const meta = severityMeta[severity];
-  return <span className="inline-flex items-center gap-1.5 text-[10px] font-bold uppercase font-serif" style={{ color: meta.tint }}><span className="font-mono text-[9px]">{meta.mark}</span>{meta.label}</span>;
+  return <span className="inline-flex items-center gap-1.5 text-[15px] font-bold  font-serif" style={{ color: meta.tint }}><span className="font-mono text-[9px]">{meta.mark}</span>{meta.label}</span>;
 }
 function PriorityPill({ priority }: { priority: Priority }) {
   const colors: Record<Priority, string> = { P0: '#8a1a1a', P1: '#a85c32', P2: '#c5a865', P3: '#4a6583' };
-  return <span className="font-serif text-[10px] font-bold" style={{ color: colors[priority] }}>{priority === 'P0' ? 'Urgent' : priority}</span>;
+  return <span className="font-serif text-[15px] font-bold" style={{ color: colors[priority] }}>{priority === 'P0' ? 'Urgent' : priority}</span>;
 }
 
 // ==========================================
@@ -349,52 +370,329 @@ function ZenModeOverlay({ bug, onClose }: { bug: Bug, onClose: () => void }) {
 // --- APP ENTRY / AUTH / SHELL / ROUTES ---
 
 function AuthScreen() {
-  const { login, signup } = useWorkspace();
   const [isSignup, setIsSignup] = useState(false);
-  const [name, setName] = useState(''); const [username, setUsername] = useState(''); const [password, setPassword] = useState(''); const [error, setError] = useState('');
-  
-  const submitAction = () => {
+  const [step, setStep] = useState<'identity' | 'otp'>('identity');
+
+  const [name, setName] = useState('');
+  const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
+  const [otp, setOtp] = useState('');
+
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [resendIn, setResendIn] = useState(0);
+
+  useEffect(() => {
+    if (resendIn <= 0) return;
+
+    const timer = window.setInterval(() => {
+      setResendIn((value) => Math.max(0, value - 1));
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [resendIn]);
+
+  const requestOtp = async () => {
     setError('');
-    if (isSignup) {
-      if (!name || !username || !password) return setError('The runes are incomplete. Fill all fields.');
-      const ok = signup(name, username, password); if (!ok) return setError('This name is already known to the Erdtree.');
-    } else {
-      if (!username || !password) return setError('Identify yourself, Tarnished.');
-      const ok = login(username, password); if (!ok) return setError('Invalid sigil or password.');
+    setNotice('');
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!normalizedEmail) {
+      setError('Offer an email address to the Erdtree.');
+      return;
     }
+
+    if (isSignup && (!name.trim() || !username.trim())) {
+      setError('The runes are incomplete. Enter a name and alias.');
+      return;
+    }
+
+    setLoading(true);
+
+    const { error: otpError } = await supabase.auth.signInWithOtp({
+      email: normalizedEmail,
+      options: {
+        shouldCreateUser: isSignup,
+        emailRedirectTo: getAuthRedirectUrl(),
+        data: isSignup
+          ? {
+              name: name.trim(),
+              username: username.trim(),
+            }
+          : undefined,
+      },
+    });
+
+    setLoading(false);
+
+    if (otpError) {
+      setError(otpError.message);
+      return;
+    }
+
+    setStep('otp');
+    setOtp('');
+    setResendIn(60);
+    setNotice(`A sign-in sigil was sent to ${normalizedEmail}.`);
+  };
+
+  const verifyOtp = async () => {
+    setError('');
+    setNotice('');
+
+    if (!/^\d{6}$/.test(otp)) {
+      setError('Enter the full six-digit sigil.');
+      return;
+    }
+
+    setLoading(true);
+
+    const { error: verifyError } = await supabase.auth.verifyOtp({
+      email: email.trim().toLowerCase(),
+      token: otp,
+      type: 'email',
+    });
+
+    setLoading(false);
+
+    if (verifyError) {
+      setError('The Grace rejects this sigil. It may be invalid or expired.');
+      return;
+    }
+
+    // AppProvider listens for Supabase auth-state changes.
+    // Do not manually fake currentUserId here.
+  };
+
+  const signInWithProvider = async (provider: 'google' | 'github') => {
+    setError('');
+    setNotice('');
+    setLoading(true);
+
+    const { error: oauthError } = await supabase.auth.signInWithOAuth({
+      provider,
+      options: {
+        redirectTo: getAuthRedirectUrl(),
+      },
+    });
+
+    // Normally the browser redirects before this matters.
+    if (oauthError) {
+      setLoading(false);
+      setError(oauthError.message);
+    }
+  };
+
+  const switchMode = () => {
+    setIsSignup((value) => !value);
+    setStep('identity');
+    setName('');
+    setUsername('');
+    setEmail('');
+    setOtp('');
+    setError('');
+    setNotice('');
+    setResendIn(0);
   };
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-[#0a0a0a] p-4 relative overflow-hidden">
-      {/* LOCAL SCADUTREE/LOGIN BACKGROUND VIA PUBLIC FOLDER */}
-      <div className="absolute inset-0 z-0 pointer-events-none bg-cover bg-top bg-no-repeat transition-opacity duration-1000" style={{ backgroundImage: `url('/tree-bg.jpg')`, opacity: 0.55 }} />
-      <div className="absolute inset-0 z-0 bg-gradient-to-b from-black/20 via-black/60 to-[#0a0a0a] pointer-events-none"></div>
-      
-      <div className="w-full max-w-sm border border-[hsl(var(--primary)/.3)] bg-[hsl(var(--background)/.7)] backdrop-blur-md p-10 shadow-[0_0_50px_rgba(197,168,101,0.15)] z-10 relative">
+      <div
+        className="absolute inset-0 z-0 pointer-events-none bg-cover bg-top bg-no-repeat transition-opacity duration-1000"
+        style={{
+          backgroundImage: `url('/tree-bg.jpg')`,
+          opacity: 0.55,
+        }}
+      />
+
+      <div className="absolute inset-0 z-0 bg-gradient-to-b from-black/20 via-black/60 to-[#0a0a0a] pointer-events-none" />
+
+      <div className="w-full max-w-sm border border-[hsl(var(--primary)/.3)] bg-[hsl(var(--background)/.7)] backdrop-blur-md p-8 sm:p-10 shadow-[0_0_50px_rgba(197,168,101,0.15)] z-10 relative">
         <div className="flex flex-col items-center text-center mb-8">
-          <span className="flex h-16 w-16 items-center justify-center border border-[hsl(var(--primary)/.4)] bg-[hsl(var(--primary)/.1)] text-[hsl(var(--primary))] erdtree-glow mb-5"><Castle size={32} strokeWidth={1.5} /></span>
-          <h1 className="text-2xl font-serif font-bold tracking-widest text-[hsl(var(--primary))] erdtree-text">Tarnished Tracker</h1>
-          <p className="mt-2 font-serif text-[10px] uppercase tracking-[0.3em] text-[hsl(var(--muted-foreground))]">The Lands Between</p>
+          <span className="flex h-16 w-16 items-center justify-center border border-[hsl(var(--primary)/.4)] bg-[hsl(var(--primary)/.1)] text-[hsl(var(--primary))] erdtree-glow mb-5">
+            <Castle size={32} strokeWidth={1.5} />
+          </span>
+
+          <h1 className="text-2xl font-serif font-bold uppercase tracking-widest text-[hsl(var(--primary))] erdtree-text">
+            Tarnished Tracker
+          </h1>
+
+          <p className="mt-2 font-serif text-[15px]  tracking-[0.3em] text-[hsl(var(--muted-foreground))]">
+            The Lands Between
+          </p>
         </div>
 
-        <h2 className="mb-6 text-center font-serif text-lg tracking-wide text-white">{isSignup ? 'Arise, Tarnished (Sign Up)' : 'Touch Grace (Sign In)'}</h2>
-        {error && <div className="mb-6 border border-[hsl(var(--destructive)/.5)] bg-[hsl(var(--destructive)/.1)] p-3 text-center text-xs font-bold text-[hsl(var(--destructive))] font-serif">{error}</div>}
+        <h2 className="mb-6 text-center font-serif text-[27px] tracking-wide text-white">
+          {step === 'otp'
+            ? 'Receive Guidance (Verify OTP)'
+            : isSignup
+              ? 'Arise, Tarnished (Sign Up)'
+              : 'Touch Grace (Sign In)'}
+        </h2>
 
-        <div className="space-y-5">
-          {isSignup && (<div><input value={name} onChange={(e) => setName(e.target.value)} placeholder="Given Name (e.g. Melina)" className="block w-full border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-2 py-2.5 text-sm font-serif text-center outline-none transition-colors focus:border-[hsl(var(--primary))] placeholder:text-[hsl(var(--muted-foreground)/.5)] text-white" /></div>)}
-          <div><input type="text" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="Alias (Username)" className="block w-full border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-2 py-2.5 text-sm font-serif text-center outline-none transition-colors focus:border-[hsl(var(--primary))] placeholder:text-[hsl(var(--muted-foreground)/.5)] text-white" /></div>
-          <div><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Secret Sigil (Password)" className="block w-full border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-2 py-2.5 text-sm font-serif text-center outline-none transition-colors focus:border-[hsl(var(--primary))] placeholder:text-[hsl(var(--muted-foreground)/.5)] text-white" /></div>
-          
-          <button onClick={submitAction} className="mt-8 w-full border border-[hsl(var(--primary))] bg-[hsl(var(--primary)/.1)] py-3.5 text-xs font-serif font-bold uppercase tracking-widest text-[hsl(var(--primary))] transition-all hover:bg-[hsl(var(--primary))] hover:text-black shadow-[0_0_15px_rgba(197,168,101,0.2)]">
-            {isSignup ? 'Become Elden Lord' : 'Enter Realm'}
-          </button>
-        </div>
+        {error && (
+          <div className="mb-5 border border-[hsl(var(--destructive)/.5)] bg-[hsl(var(--destructive)/.1)] p-3 text-center text-lg font-bold text-[hsl(var(--destructive))] font-serif">
+            {error}
+          </div>
+        )}
 
-        <div className="mt-8 border-t border-[hsl(var(--border)/.5)] pt-6 text-center">
-          <button type="button" onClick={() => { setIsSignup(!isSignup); setError(''); setUsername(''); setPassword(''); setName(''); }} className="font-serif text-xs font-bold tracking-wide text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--primary))] transition-colors">
-            {isSignup ? 'Already bear the mark? Touch Grace.' : 'Maidenless? Seek the Erdtree.'}
-          </button>
-        </div>
+        {notice && (
+          <div className="mb-5 border border-[hsl(var(--primary)/.35)] bg-[hsl(var(--primary)/.08)] p-3 text-center text-lg font-serif text-[hsl(var(--primary))]">
+            {notice}
+          </div>
+        )}
+
+        {step === 'identity' ? (
+          <>
+            <div className="space-y-4">
+              {isSignup && (
+                <>
+                  <input
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    autoComplete="name"
+                    placeholder="Given Name (e.g. Melina)"
+                    className="block w-full border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-2 py-2.5 text-xl font-serif text-center outline-none transition-colors focus:border-[hsl(var(--primary))] placeholder:text-[hsl(var(--muted-foreground)/.5)] text-white"
+                  />
+
+                  <input
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    autoComplete="username"
+                    placeholder="Alias (Username)"
+                    className="block w-full border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-2 py-2.5 text-xl font-serif text-center outline-none transition-colors focus:border-[hsl(var(--primary))] placeholder:text-[hsl(var(--muted-foreground)/.5)] text-white"
+                  />
+                </>
+              )}
+
+              <input
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                autoComplete="email"
+                placeholder="Gracebound Email"
+                className="block w-full border-b border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-2 py-2.5 text-xl font-serif text-center outline-none transition-colors focus:border-[hsl(var(--primary))] placeholder:text-[hsl(var(--muted-foreground)/.5)] text-white"
+              />
+
+              <button
+                type="button"
+                onClick={() => void requestOtp()}
+                disabled={loading}
+                className="mt-5 w-full border border-[hsl(var(--primary))] bg-[hsl(var(--primary)/.1)] py-3.5 text-lg font-serif font-bold  text-[hsl(var(--primary))] transition-all hover:bg-[hsl(var(--primary))] hover:text-black shadow-[0_0_15px_rgba(197,168,101,0.2)] disabled:opacity-50"
+              >
+                {loading ? 'Seeking Grace...' : 'Send Email Sigil (OTP)'}
+              </button>
+            </div>
+
+            <div className="my-6 flex items-center gap-3">
+              <div className="h-px flex-1 bg-[hsl(var(--border)/.6)]" />
+              <span className="text-[9px]  text-[hsl(var(--muted-foreground))]">
+                or
+              </span>
+              <div className="h-px flex-1 bg-[hsl(var(--border)/.6)]" />
+            </div>
+
+            <div className="grid gap-3">
+              <button
+                type="button"
+                onClick={() => void signInWithProvider('google')}
+                disabled={loading}
+                className="w-full border border-[hsl(var(--border))] bg-black/30 px-4 py-3 text-lg font-serif font-bold tracking-wide text-white transition-colors hover:border-[hsl(var(--primary)/.5)] hover:text-[hsl(var(--primary))] disabled:opacity-50"
+              >
+                Continue with Google
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void signInWithProvider('github')}
+                disabled={loading}
+                className="w-full border border-[hsl(var(--border))] bg-black/30 px-4 py-3 text-lg font-serif font-bold tracking-wide text-white transition-colors hover:border-[hsl(var(--primary)/.5)] hover:text-[hsl(var(--primary))] disabled:opacity-50"
+              >
+                Continue with GitHub
+              </button>
+            </div>
+          </>
+        ) : (
+          <div>
+            <p className="mb-5 text-center font-serif text-lg leading-relaxed text-[hsl(var(--muted-foreground))]">
+              Enter the six-digit code sent to
+              <br />
+              <span className="text-[hsl(var(--primary))]">{email}</span>
+            </p>
+
+            <OTPInput
+              maxLength={6}
+              value={otp}
+              onChange={setOtp}
+              containerClassName="flex justify-center gap-2"
+              render={({ slots }) => (
+                <>
+                  {slots.map((slot, index) => (
+                    <div
+                      key={index}
+                      className={`flex h-12 w-10 items-center justify-center border bg-black/40 font-mono text-lg ${
+                        slot.isActive
+                          ? 'border-[hsl(var(--primary))] text-[hsl(var(--primary))] shadow-[0_0_12px_rgba(197,168,101,0.15)]'
+                          : 'border-[hsl(var(--border))] text-white'
+                      }`}
+                    >
+                      {slot.char ?? ''}
+                    </div>
+                  ))}
+                </>
+              )}
+            />
+
+            <button
+              type="button"
+              onClick={() => void verifyOtp()}
+              disabled={loading || otp.length !== 6}
+              className="mt-6 w-full border border-[hsl(var(--primary))] bg-[hsl(var(--primary)/.1)] py-3.5 text-lg font-serif font-bold  text-[hsl(var(--primary))] transition-all hover:bg-[hsl(var(--primary))] hover:text-black shadow-[0_0_15px_rgba(197,168,101,0.2)] disabled:opacity-50"
+            >
+              {loading ? 'Communing...' : 'Verify Grace'}
+            </button>
+
+            <div className="mt-4 flex items-center justify-between gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setStep('identity');
+                  setOtp('');
+                  setError('');
+                  setNotice('');
+                }}
+                className="text-[15px] font-serif font-bold text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--primary))]"
+              >
+                Change email
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void requestOtp()}
+                disabled={loading || resendIn > 0}
+                className="text-[15px] font-serif font-bold text-[hsl(var(--primary))] disabled:text-[hsl(var(--muted-foreground))]"
+              >
+                {resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend code'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === 'identity' && (
+          <div className="mt-8 border-t border-[hsl(var(--border)/.5)] pt-6 text-center">
+            <button
+              type="button"
+              onClick={switchMode}
+              className="font-serif text-lg font-bold tracking-wide text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--primary))] transition-colors"
+            >
+              {isSignup
+                ? 'Already bear the mark? Touch Grace.'
+                : 'Maidenless? Seek the Erdtree.'}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -575,14 +873,14 @@ function BugRow({ bug, onOpen }: { bug: Bug; onOpen?: () => void }) {
   const assignee = (store.users || []).find((user) => user.id === bug.assigneeId);
   const component = (store.components || []).find((item) => item.id === bug.componentId);
   return <button onClick={onOpen} className="group grid w-full grid-cols-[minmax(0,1fr)_100px_100px_100px_70px_32px] items-center gap-4 border-b border-[hsl(var(--border)/.5)] px-5 py-4 text-left transition-all last:border-0 hover:bg-[hsl(var(--muted)/.6)]">
-    <div className="min-w-0"><div className="flex min-w-0 items-center gap-3"><span className="font-mono text-[11px] font-bold text-[hsl(var(--muted-foreground))] group-hover:text-[hsl(var(--primary))] transition-colors">{bug.key}</span><span className="truncate text-sm font-serif font-bold text-[hsl(var(--foreground))]">{bug.title}</span>{bug.dependsOn?.length > 0 && <Link2 size={12} className="shrink-0 text-[hsl(var(--primary))]" />}</div><div className="mt-2 flex items-center gap-2 font-mono text-[9px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]"><span className="h-1.5 w-1.5 rounded-full" style={{ background: component?.color }} />{component?.name}<span className="text-[hsl(var(--border))]">·</span>{relativeDate(bug.updatedAt)}</div></div>
-    <div className="flex gap-1.5 overflow-hidden">{(bug.tags || []).slice(0,2).map(t => <span key={t} className="truncate border border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-[hsl(var(--primary))]">{t}</span>)}</div>
+    <div className="min-w-0"><div className="flex min-w-0 items-center gap-3"><span className="font-mono text-[11px] font-bold text-[hsl(var(--muted-foreground))] group-hover:text-[hsl(var(--primary))] transition-colors">{bug.key}</span><span className="truncate text-xl font-serif font-bold text-[hsl(var(--foreground))]">{bug.title}</span>{bug.dependsOn?.length > 0 && <Link2 size={12} className="shrink-0 text-[hsl(var(--primary))]" />}</div><div className="mt-2 flex items-center gap-2 font-mono text-[9px]  tracking-wider text-[hsl(var(--muted-foreground))]"><span className="h-1.5 w-1.5 rounded-full" style={{ background: component?.color }} />{component?.name}<span className="text-[hsl(var(--border))]">·</span>{relativeDate(bug.updatedAt)}</div></div>
+    <div className="flex gap-1.5 overflow-hidden">{(bug.tags || []).slice(0,2).map(t => <span key={t} className="truncate border border-[hsl(var(--border))] bg-[hsl(var(--background)/.5)] px-1.5 py-0.5 text-[9px] font-bold  tracking-wider text-[hsl(var(--primary))]">{t}</span>)}</div>
     <StageBadge stage={bug.stage} compact /><SeverityBadge severity={bug.severity} /><PriorityPill priority={bug.priority} /><Avatar user={assignee} />
   </button>;
 }
 
 function EmptyState({ title, description, action }: { title: string; description: string; action?: ReactNode }) {
-  return <div className="flex flex-col items-center justify-center border border-dashed border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.3)] px-5 py-24 text-center"><span className="mb-6 flex h-16 w-16 items-center justify-center border border-[hsl(var(--primary)/.3)] bg-[hsl(var(--primary)/.05)] text-[hsl(var(--primary))] shadow-inner"><Ghost size={28} /></span><h3 className="text-lg font-serif font-bold text-[hsl(var(--primary))]">{title}</h3><p className="mt-3 max-w-sm font-serif text-[13px] leading-relaxed text-[hsl(var(--muted-foreground))]">{description}</p>{action && <div className="mt-8">{action}</div>}</div>;
+  return <div className="flex flex-col items-center justify-center border border-dashed border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.3)] px-5 py-24 text-center"><span className="mb-6 flex h-16 w-16 items-center justify-center border border-[hsl(var(--primary)/.3)] bg-[hsl(var(--primary)/.05)] text-[hsl(var(--primary))] shadow-inner"><Ghost size={28} /></span><h3 className="text-[27px] font-serif font-bold text-[hsl(var(--primary))]">{title}</h3><p className="mt-3 max-w-sm font-serif text-[19px] leading-relaxed text-[hsl(var(--muted-foreground))]">{description}</p>{action && <div className="mt-8">{action}</div>}</div>;
 }
 
 function WorkspacePage() {
@@ -620,55 +918,55 @@ function WorkspacePage() {
 
   return (
     <div className="mx-auto w-full max-w-[1600px] px-5 py-8 md:px-10 lg:px-12 relative z-10">
-      <SectionHeader eyebrow={`Realm · ${currentWs?.name ?? ''}`} title="The Lands Between" description="Track the great foes that plague this realm. Slay them to restore the Golden Order." action={<div className="flex items-center gap-3"><Link href="/dashboard" className="hidden items-center gap-2 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md px-4 py-2.5 text-xs font-serif font-bold uppercase tracking-widest text-[hsl(var(--muted-foreground))] no-underline hover:bg-[hsl(var(--muted)/.8)] hover:text-[hsl(var(--primary))] sm:inline-flex transition-colors"><Activity size={14} /> Runes & Records</Link><button onClick={() => setShowNew(true)} className="flex items-center gap-2 bg-[hsl(var(--primary))] px-6 py-2.5 text-xs font-serif font-bold uppercase tracking-widest text-black shadow-[0_0_15px_rgba(197,168,101,0.3)] transition-transform hover:brightness-125"><Swords size={14} /> Declare Foe <span className="font-sans normal-case tracking-normal opacity-70 text-[9px]">(New Issue)</span></button></div>} />
+      <SectionHeader eyebrow={`Realm · ${currentWs?.name ?? ''}`} title="The Lands Between" description="Track the great foes that plague this realm. Slay them to restore the Golden Order." action={<div className="flex items-center gap-3"><Link href="/dashboard" className="hidden items-center gap-2 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md px-4 py-2.5 text-lg font-serif font-bold  text-[hsl(var(--muted-foreground))] no-underline hover:bg-[hsl(var(--muted)/.8)] hover:text-[hsl(var(--primary))] sm:inline-flex transition-colors"><Activity size={14} /> Runes & Records</Link><button onClick={() => setShowNew(true)} className="flex items-center gap-2 bg-[hsl(var(--primary))] px-6 py-2.5 text-lg font-serif font-bold  text-black shadow-[0_0_15px_rgba(197,168,101,0.3)] transition-transform hover:brightness-125"><Swords size={14} /> Declare Foe <span className="font-sans normal-case tracking-normal opacity-70 text-[9px]">(New Issue)</span></button></div>} />
       
       <div className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-4">
-        {[{ label: 'Active Foes', value: workspaceBugs.filter((b) => b.stage !== 'Closed').length, note: 'roaming the lands', color: '#c5a865' }, { label: 'Cursed (Blocked)', value: workspaceBugs.filter((b) => b.stage === 'Blocked').length, note: 'requires cleansing', color: '#8a1a1a' }, { label: 'Roundtable', value: workspaceBugs.filter((b) => b.stage === 'In Review').length, note: 'seeking counsel', color: '#4a6583' }, { label: 'Felled Recently', value: workspaceBugs.filter((b) => b.stage === 'Closed' && new Date(b.updatedAt).getTime() > Date.now() - 30 * 86400000).length, note: 'victories claimed', color: '#555555' }].map((stat, index) => <div key={stat.label} className={`border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-5 shadow-sm transition-transform hover:-translate-y-1 hover:border-[hsl(var(--primary)/.4)] ${index === 0 ? 'sm:col-span-1' : ''}`}><div className="flex items-center justify-between"><p className="text-[10px] font-bold uppercase tracking-widest font-serif text-[hsl(var(--muted-foreground))]">{stat.label}</p><span className="h-2 w-2 rounded-full shadow-[0_0_8px_currentColor]" style={{ background: stat.color, color: stat.color }} /></div><p className="mt-4 font-serif text-3xl font-bold tracking-tight text-[hsl(var(--foreground))]">{stat.value}</p><p className="mt-2 text-[10px] font-serif italic text-[hsl(var(--muted-foreground))]">{stat.note}</p></div>)}
+        {[{ label: 'Active Foes', value: workspaceBugs.filter((b) => b.stage !== 'Closed').length, note: 'roaming the lands', color: '#c5a865' }, { label: 'Cursed (Blocked)', value: workspaceBugs.filter((b) => b.stage === 'Blocked').length, note: 'requires cleansing', color: '#8a1a1a' }, { label: 'Roundtable', value: workspaceBugs.filter((b) => b.stage === 'In Review').length, note: 'seeking counsel', color: '#4a6583' }, { label: 'Felled Recently', value: workspaceBugs.filter((b) => b.stage === 'Closed' && new Date(b.updatedAt).getTime() > Date.now() - 30 * 86400000).length, note: 'victories claimed', color: '#555555' }].map((stat, index) => <div key={stat.label} className={`border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-5 shadow-sm transition-transform hover:-translate-y-1 hover:border-[hsl(var(--primary)/.4)] ${index === 0 ? 'sm:col-span-1' : ''}`}><div className="flex items-center justify-between"><p className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">{stat.label}</p><span className="h-2 w-2 rounded-full shadow-[0_0_8px_currentColor]" style={{ background: stat.color, color: stat.color }} /></div><p className="mt-4 font-serif text-3xl font-bold tracking-tight text-[hsl(var(--foreground))]">{stat.value}</p><p className="mt-2 text-[15px] font-serif italic text-[hsl(var(--muted-foreground))]">{stat.note}</p></div>)}
       </div>
       
       <div className="mb-6 flex flex-col gap-3 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-3 shadow-sm sm:flex-row sm:items-center">
         {/* CLEANER SEARCH BAR FIX */}
         <div className="relative min-w-0 flex-1">
           <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-[hsl(var(--primary))]" />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="SEARCH BY SIGIL, NAME, LORE..." className="h-12 w-full bg-[hsl(var(--background)/.5)] pl-12 pr-4 text-xs font-serif font-bold tracking-wider outline-none transition-colors placeholder:text-[hsl(var(--muted-foreground))]/50 border border-[hsl(var(--border)/.5)] focus:border-[hsl(var(--primary)/.5)] text-[hsl(var(--foreground))]" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="SEARCH BY SIGIL, NAME, LORE..." className="h-12 w-full bg-[hsl(var(--background)/.5)] pl-12 pr-4 text-lg font-serif font-bold tracking-wider outline-none transition-colors placeholder:text-[hsl(var(--muted-foreground))]/50 border border-[hsl(var(--border)/.5)] focus:border-[hsl(var(--primary)/.5)] text-[hsl(var(--foreground))]" />
         </div>
 
         <div className="flex items-center gap-3 overflow-x-auto">
           {/* TALLER BUTTONS FOR PROPORTION FIX */}
           <div className="hidden h-12 items-center gap-2 sm:flex">
-            <button onClick={() => { setStageFilter('All'); setSeverityFilter('Critical'); setComponentFilter('All'); }} className="h-full border border-[#8a1a1a]/30 bg-[#8a1a1a]/10 px-4 text-[10px] font-bold font-serif uppercase tracking-widest text-[#8a1a1a] hover:bg-[#8a1a1a]/20 transition-colors">Demigods</button>
-            <button onClick={() => { setStageFilter('All'); setSeverityFilter('All'); setComponentFilter('All'); setQuery(store.currentUserId || ''); }} className="h-full border border-[hsl(var(--primary))/30] bg-[hsl(var(--primary))/10] px-4 text-[10px] font-bold font-serif uppercase tracking-widest text-[hsl(var(--primary))] hover:bg-[hsl(var(--primary))/20] transition-colors">My Battles</button>
+            <button onClick={() => { setStageFilter('All'); setSeverityFilter('Critical'); setComponentFilter('All'); }} className="h-full border border-[#8a1a1a]/30 bg-[#8a1a1a]/10 px-4 text-[15px] font-bold font-serif  text-[#8a1a1a] hover:bg-[#8a1a1a]/20 transition-colors">Demigods</button>
+            <button onClick={() => { setStageFilter('All'); setSeverityFilter('All'); setComponentFilter('All'); setQuery(store.currentUserId || ''); }} className="h-full border border-[hsl(var(--primary))/30] bg-[hsl(var(--primary))/10] px-4 text-[15px] font-bold font-serif  text-[hsl(var(--primary))] hover:bg-[hsl(var(--primary))/20] transition-colors">My Battles</button>
           </div>
           
           <span className="hidden h-8 w-px bg-[hsl(var(--border))] sm:block" />
           
           <div className="flex h-12 items-center border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] p-1">
-            <button onClick={() => setViewMode('list')} className={`flex h-full items-center gap-2 px-4 text-[10px] font-serif font-bold uppercase tracking-widest transition-all ${viewMode === 'list' ? 'bg-[hsl(var(--card))] text-[hsl(var(--primary))] shadow-sm border border-[hsl(var(--border)/.5)]' : 'text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] border border-transparent'}`}><ListFilter size={14} /> Codex <span className="font-sans normal-case opacity-70 tracking-normal text-[9px] hidden xl:inline">(List)</span></button>
-            <button onClick={() => setViewMode('board')} className={`flex h-full items-center gap-2 px-4 text-[10px] font-serif font-bold uppercase tracking-widest transition-all ${viewMode === 'board' ? 'bg-[hsl(var(--card))] text-[hsl(var(--primary))] shadow-sm border border-[hsl(var(--border)/.5)]' : 'text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] border border-transparent'}`}><Layers3 size={14} /> Map <span className="font-sans normal-case opacity-70 tracking-normal text-[9px] hidden xl:inline">(Board)</span></button>
+            <button onClick={() => setViewMode('list')} className={`flex h-full items-center gap-2 px-4 text-[15px] font-serif font-bold  transition-all ${viewMode === 'list' ? 'bg-[hsl(var(--card))] text-[hsl(var(--primary))] shadow-sm border border-[hsl(var(--border)/.5)]' : 'text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] border border-transparent'}`}><ListFilter size={14} /> Codex <span className="font-sans normal-case opacity-70 tracking-normal text-[9px] hidden xl:inline">(List)</span></button>
+            <button onClick={() => setViewMode('board')} className={`flex h-full items-center gap-2 px-4 text-[15px] font-serif font-bold  transition-all ${viewMode === 'board' ? 'bg-[hsl(var(--card))] text-[hsl(var(--primary))] shadow-sm border border-[hsl(var(--border)/.5)]' : 'text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] border border-transparent'}`}><Layers3 size={14} /> Map <span className="font-sans normal-case opacity-70 tracking-normal text-[9px] hidden xl:inline">(Board)</span></button>
           </div>
           
           <span className="hidden h-8 w-px bg-[hsl(var(--border))] sm:block" />
           
-          <button onClick={() => setShowFilters(!showFilters)} className={`flex h-12 shrink-0 items-center gap-2 border px-4 text-[10px] font-serif font-bold uppercase tracking-widest transition-colors ${showFilters || activeCount ? 'bg-[hsl(var(--primary)/.1)] border-[hsl(var(--primary)/.5)] text-[hsl(var(--primary))]' : 'border-[hsl(var(--border)/.5)] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--muted)/.8)] hover:text-[hsl(var(--foreground))]'}`}><SlidersHorizontal size={14} /> Divination {activeCount > 0 && <span className="bg-[hsl(var(--primary))] px-1.5 py-0.5 text-black">{activeCount}</span>}</button>
-          {activeCount > 0 && <button onClick={() => { setQuery(''); setStageFilter('All'); setSeverityFilter('All'); setComponentFilter('All'); }} className="shrink-0 text-[10px] font-bold uppercase tracking-widest text-[hsl(var(--primary))] hover:underline font-serif">Clear</button>}
+          <button onClick={() => setShowFilters(!showFilters)} className={`flex h-12 shrink-0 items-center gap-2 border px-4 text-[15px] font-serif font-bold  transition-colors ${showFilters || activeCount ? 'bg-[hsl(var(--primary)/.1)] border-[hsl(var(--primary)/.5)] text-[hsl(var(--primary))]' : 'border-[hsl(var(--border)/.5)] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--muted)/.8)] hover:text-[hsl(var(--foreground))]'}`}><SlidersHorizontal size={14} /> Divination {activeCount > 0 && <span className="bg-[hsl(var(--primary))] px-1.5 py-0.5 text-black">{activeCount}</span>}</button>
+          {activeCount > 0 && <button onClick={() => { setQuery(''); setStageFilter('All'); setSeverityFilter('All'); setComponentFilter('All'); }} className="shrink-0 text-[15px] font-bold  text-[hsl(var(--primary))] hover:underline font-serif">Clear</button>}
         </div>
       </div>
       
-      {showFilters && <div className="mb-6 grid grid-cols-1 gap-4 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-6 sm:grid-cols-3"><label className="text-[10px] font-bold uppercase tracking-widest font-serif text-[hsl(var(--muted-foreground))]">Battle State <span className="tracking-normal font-sans opacity-70">(Status)</span><select value={stageFilter} onChange={(event) => setStageFilter(event.target.value as Stage | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-xs font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option>All</option>{stages.map((stage) => <option key={stage}>{stageMeta[stage].label}</option>)}</select></label><label className="text-[10px] font-bold uppercase tracking-widest font-serif text-[hsl(var(--muted-foreground))]">Threat Level <span className="tracking-normal font-sans opacity-70">(Severity)</span><select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value as Severity | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-xs font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option>All</option>{Object.keys(severityMeta).map((severity) => <option key={severity}>{severityMeta[severity as Severity].label}</option>)}</select></label><label className="text-[10px] font-bold uppercase tracking-widest font-serif text-[hsl(var(--muted-foreground))]">Region <span className="tracking-normal font-sans opacity-70">(Component)</span><select value={componentFilter} onChange={(event) => setComponentFilter(event.target.value)} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-xs font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option value="All">All</option>{store.components.filter(c => c.productId === (store.products.find(p => p.workspaceId === currentWs?.id)?.id)).map((component) => <option key={component.id} value={component.id}>{component.name}</option>)}</select></label></div>}
+      {showFilters && <div className="mb-6 grid grid-cols-1 gap-4 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-6 sm:grid-cols-3"><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Battle State <span className="tracking-normal font-sans opacity-70">(Status)</span><select value={stageFilter} onChange={(event) => setStageFilter(event.target.value as Stage | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option>All</option>{stages.map((stage) => <option key={stage}>{stageMeta[stage].label}</option>)}</select></label><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Threat Level <span className="tracking-normal font-sans opacity-70">(Severity)</span><select value={severityFilter} onChange={(event) => setSeverityFilter(event.target.value as Severity | 'All')} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option>All</option>{Object.keys(severityMeta).map((severity) => <option key={severity}>{severityMeta[severity as Severity].label}</option>)}</select></label><label className="text-[15px] font-bold  font-serif text-[hsl(var(--muted-foreground))]">Region <span className="tracking-normal font-sans opacity-70">(Component)</span><select value={componentFilter} onChange={(event) => setComponentFilter(event.target.value)} className="mt-3 block w-full border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] px-3 py-3 text-lg font-serif font-bold outline-none shadow-sm focus:border-[hsl(var(--primary))]"><option value="All">All</option>{store.components.filter(c => c.productId === (store.products.find(p => p.workspaceId === currentWs?.id)?.id)).map((component) => <option key={component.id} value={component.id}>{component.name}</option>)}</select></label></div>}
       
       {viewMode === 'list' ? (
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
-          <div className="min-w-0 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md shadow-sm"><div className="flex items-center justify-between border-b border-[hsl(var(--border)/.5)] px-5 py-4 bg-[hsl(var(--background)/.5)]"><div className="flex items-center gap-3"><Crosshair size={18} className="text-[hsl(var(--primary))]" /><span className="text-sm font-serif font-bold tracking-widest uppercase">Known Foes</span></div><span className="font-mono text-[10px] uppercase font-bold text-[hsl(var(--muted-foreground))]">{filtered.length} Discovered</span></div>{filtered.length === 0 ? <div className="p-8"><EmptyState title="No foes found" description="The lands are quiet. Declare a foe to begin the hunt." action={<button onClick={() => setShowNew(true)} className="mt-6 border border-[hsl(var(--primary))] bg-[hsl(var(--primary)/.1)] px-8 py-3 text-xs font-serif font-bold uppercase tracking-widest text-[hsl(var(--primary))] hover:bg-[hsl(var(--primary))] hover:text-black transition-all"><Swords size={14} className="inline mr-2" /> Declare Foe</button>} /></div> : <div>{filtered.map((bug) => <BugRow key={bug.id} bug={bug} onOpen={() => setLocation(`/bugs/${bug.id}`)} />)}</div>}</div>
+          <div className="min-w-0 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md shadow-sm"><div className="flex items-center justify-between border-b border-[hsl(var(--border)/.5)] px-5 py-4 bg-[hsl(var(--background)/.5)]"><div className="flex items-center gap-3"><Crosshair size={18} className="text-[hsl(var(--primary))]" /><span className="text-xl font-serif font-bold  ">Known Foes</span></div><span className="font-mono text-[10px]  font-bold text-[hsl(var(--muted-foreground))]">{filtered.length} Discovered</span></div>{filtered.length === 0 ? <div className="p-8"><EmptyState title="No foes found" description="The lands are quiet. Declare a foe to begin the hunt." action={<button onClick={() => setShowNew(true)} className="mt-6 border border-[hsl(var(--primary))] bg-[hsl(var(--primary)/.1)] px-8 py-3 text-lg font-serif font-bold  text-[hsl(var(--primary))] hover:bg-[hsl(var(--primary))] hover:text-black transition-all"><Swords size={14} className="inline mr-2" /> Declare Foe</button>} /></div> : <div>{filtered.map((bug) => <BugRow key={bug.id} bug={bug} onOpen={() => setLocation(`/bugs/${bug.id}`)} />)}</div>}</div>
           <aside className="space-y-6">
-            <div className="border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-6 shadow-sm"><div className="flex items-center gap-3"><Map size={18} className="text-[hsl(var(--primary))]" /><h2 className="text-sm font-serif font-bold uppercase tracking-widest text-[hsl(var(--foreground))]">The Path</h2></div><p className="mt-3 text-[12px] font-serif leading-relaxed text-[hsl(var(--muted-foreground))]">Guide the foe through the rites of battle. Only when its resolution is certain may it be Felled.</p><div className="mt-6 space-y-3">{stages.slice(0, 5).map((stage, index) => <div key={stage} className="flex items-center gap-4 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] p-3"><span className="flex h-7 w-7 items-center justify-center font-serif text-[11px] font-bold text-black" style={{ background: stageMeta[stage].tint }}>{index + 1}</span><span className="text-xs font-serif font-bold uppercase tracking-widest">{stageMeta[stage].label}</span>{index < 4 && <ArrowRight size={14} className="ml-auto text-[hsl(var(--muted-foreground))]" />}</div>)}</div></div>
-            <div className="border border-[hsl(var(--destructive)/.5)] bg-[hsl(var(--destructive)/.05)] backdrop-blur-md p-6 shadow-[0_0_30px_rgba(138,26,26,0.1)]"><div className="flex items-center justify-between"><p className="font-serif text-[10px] font-bold uppercase tracking-widest text-[hsl(var(--destructive))]">Destined Death</p><Skull size={18} className="text-[hsl(var(--destructive))]" /></div><p className="mt-5 font-serif text-4xl font-bold tracking-widest text-[hsl(var(--foreground))]">{workspaceBugs.filter((bug) => bug.stage === 'Blocked').length === 0 ? 'No Curses.' : `${workspaceBugs.filter((bug) => bug.stage === 'Blocked').length} Cursed.`}</p><p className="mt-3 font-serif text-xs leading-relaxed text-[hsl(var(--muted-foreground))]">Foes marked as Cursed (Blocked) halt the progression of the Golden Order. Cleanse them immediately.</p></div>
+            <div className="border border-[hsl(var(--border)/.5)] bg-[hsl(var(--card)/.6)] backdrop-blur-md p-6 shadow-sm"><div className="flex items-center gap-3"><Map size={18} className="text-[hsl(var(--primary))]" /><h2 className="text-xl font-serif font-bold  text-[hsl(var(--foreground))]">The Path</h2></div><p className="mt-3 text-lg font-serif leading-relaxed text-[hsl(var(--muted-foreground))]">Guide the foe through the rites of battle. Only when its resolution is certain may it be Felled.</p><div className="mt-6 space-y-3">{stages.slice(0, 5).map((stage, index) => <div key={stage} className="flex items-center gap-4 border border-[hsl(var(--border)/.5)] bg-[hsl(var(--background)/.5)] p-3"><span className="flex h-7 w-7 items-center justify-center font-serif text-base font-bold text-black" style={{ background: stageMeta[stage].tint }}>{index + 1}</span><span className="text-lg font-serif font-bold ">{stageMeta[stage].label}</span>{index < 4 && <ArrowRight size={14} className="ml-auto text-[hsl(var(--muted-foreground))]" />}</div>)}</div></div>
+            <div className="border border-[hsl(var(--destructive)/.5)] bg-[hsl(var(--destructive)/.05)] backdrop-blur-md p-6 shadow-[0_0_30px_rgba(138,26,26,0.1)]"><div className="flex items-center justify-between"><p className="font-serif text-[15px] font-bold  text-[hsl(var(--destructive))]">Destined Death</p><Skull size={18} className="text-[hsl(var(--destructive))]" /></div><p className="mt-5 font-serif text-4xl font-bold  text-[hsl(var(--foreground))]">{workspaceBugs.filter((bug) => bug.stage === 'Blocked').length === 0 ? 'No Curses.' : `${workspaceBugs.filter((bug) => bug.stage === 'Blocked').length} Cursed.`}</p><p className="mt-3 font-serif text-lg leading-relaxed text-[hsl(var(--muted-foreground))]">Foes marked as Cursed (Blocked) halt the progression of the Golden Order. Cleanse them immediately.</p></div>
           </aside>
         </div>
       ) : (
         <KanbanBoard bugs={filtered} onMove={updateBugStage} />
       )}
 
-      {toast && <div className="fixed bottom-8 left-1/2 z-50 flex -translate-x-1/2 items-center gap-3 border border-[hsl(var(--primary))] bg-black px-6 py-3.5 text-xs font-serif font-bold uppercase tracking-widest text-[hsl(var(--primary))] shadow-[0_0_30px_rgba(197,168,101,0.2)]"><Flame size={16} />{toast}</div>}
+      {toast && <div className="fixed bottom-8 left-1/2 z-50 flex -translate-x-1/2 items-center gap-3 border border-[hsl(var(--primary))] bg-black px-6 py-3.5 text-lg font-serif font-bold  text-[hsl(var(--primary))] shadow-[0_0_30px_rgba(197,168,101,0.2)]"><Flame size={16} />{toast}</div>}
       {showNew && <NewBugModal onClose={() => setShowNew(false)} onCreated={(id) => { setShowNew(false); setLocation(`/bugs/${id}`); }} />}
     </div>
   );
@@ -687,7 +985,6 @@ function BugDetailPage() {
   const [activeTab, setActiveTab] = useState<'story' | 'diff'>('story');
   
   const [zenMode, setZenMode] = useState(false);
-  const [isGeneratingFix, setIsGeneratingFix] = useState(false);
 
   if (!bug) return <div className="mx-auto max-w-2xl px-5 py-20 relative z-10"><EmptyState title="Foe not found" description="It may have been vanquished or belongs to another realm." /></div>;
   
@@ -701,17 +998,6 @@ function BugDetailPage() {
   const move = (direction: -1 | 1) => { const index = stages.indexOf(bug.stage); const next = stages[Math.max(0, Math.min(stages.length - 1, index + direction))]; if (next === bug.stage) return; updateBug({ stage: next, resolution: next === 'Closed' ? bug.resolution ?? 'Fixed' : null }, 'stage', bug.stage, next); setToast(`Advanced to ${stageMeta[next].label}`); window.setTimeout(() => setToast(''), 2200); };
   const addComment = () => { if (!comment.trim()) return; const entry: Comment = { id: uid('comment'), authorId: store.currentUserId ?? 'u1', body: comment.trim(), commentType, createdAt: now() }; updateBug({ comments: [...(bug.comments||[]), entry] }); setComment(''); setToast('Lore transcribed'); window.setTimeout(() => setToast(''), 2200); };
   const addAttachment = (event: React.ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { const attachment: Attachment = { id: uid('attachment'), fileName: file.name, fileUrl: String(reader.result), uploadedBy: store.currentUserId ?? 'u1', createdAt: now() }; updateStore((current) => ({ ...current, bugs: current.bugs.map((item) => item.id === bug.id ? { ...item, attachments: [...(item.attachments||[]), attachment], updatedAt: now() } : item) })); setToast('Vision recorded'); window.setTimeout(() => setToast(''), 2200); }; reader.readAsDataURL(file); };
-
-  const generateAIFix = () => {
-    setIsGeneratingFix(true);
-    setTimeout(() => {
-      setIsGeneratingFix(false);
-      const fakePatch = `@@ -12,4 +12,6 @@ function executeWorkflow(data) {\n-  processData(data);\n+  if (!data || !data.isValid) {\n+    throw new Error('Curse averted: Invalid data payload');\n+  }\n+  return processData(data); // Added Golden Order incantation\n }`;
-      updateBug({ codePatch: fakePatch }, 'codePatch', '', 'Guidance of Grace applied');
-      setToast('Incantation Drafted by Grace');
-      setTimeout(() => setToast(''), 2200);
-    }, 2500);
-  };
 
   const renderDiffLine = (line: string, idx: number) => {
     if (line.startsWith('+')) return <div key={idx} className="bg-[#c5a865]/10 px-4 py-0.5 text-[#c5a865]"><span className="mr-4 inline-block w-4 select-none opacity-50">+</span>{line.substring(1)}</div>;
